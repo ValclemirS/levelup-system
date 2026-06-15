@@ -1,0 +1,9 @@
+# Não enviar para a Vercel (ela instala as dependências no build)
+node_modules
+.env
+.env.local
+*.log
+npm-debug.log*
+.DS_Store
+coverage
+dist
