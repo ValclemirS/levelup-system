@@ -1,7 +1,7 @@
 {
-  "version": 2,
-  "builds": [{ "src": "server.js", "use": "@vercel/node" }],
-  "routes": [{ "src": "/(.*)", "dest": "/server.js" }],
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api" }
+  ],
   "crons": [
     { "path": "/api/cron/morning", "schedule": "0 11 * * *" },
     { "path": "/api/cron/streak", "schedule": "0 0 * * *" }
