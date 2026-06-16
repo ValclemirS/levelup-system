@@ -42,15 +42,13 @@ export async function sendPush(tokens, { title, body, data = {} }) {
 }
 
 /**
- * Busca todos os usuários com pushToken e dispara a mesma mensagem.
- * Usado pelo cron de lembretes diários.
+ * Dispara a mesma mensagem para uma lista de Expo Push Tokens.
+ * A seleção de quais usuários notificar é feita por quem chama
+ * (ver os crons em server.js), mantendo este util desacoplado do banco.
+ *
+ * @param {string[]} tokens
+ * @param {object} payload - { title, body, data }
  */
-export async function broadcastPush(UserModel, filter, payload) {
-  const users = await UserModel.find({
-    ...filter,
-    pushToken: { $ne: null },
-  }).select('pushToken');
-
-  const tokens = users.map((u) => u.pushToken);
-  await sendPush(tokens, payload);
+export async function broadcastPush(tokens, payload) {
+  await sendPush(tokens || [], payload);
 }

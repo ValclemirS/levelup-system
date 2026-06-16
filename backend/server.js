@@ -5,11 +5,10 @@ import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
 
 import cron from 'node-cron';
-import { connectDB } from './src/config/db.js';
+import { supabase } from './src/config/supabase.js';
 import apiRoutes from './src/routes/index.js';
 import { notFound, errorHandler } from './src/middleware/errorHandler.js';
 import { broadcastPush } from './src/utils/pushNotifications.js';
-import User from './src/models/User.js';
 
 dotenv.config();
 
@@ -20,7 +19,7 @@ const isVercel = !!process.env.VERCEL;
 // ---- Validação de variáveis de ambiente obrigatórias ----
 // Falha cedo e com mensagem clara, evitando rodar com segredo inseguro.
 const INSECURE_SECRET = 'troque_este_segredo_por_uma_string_longa_e_aleatoria';
-const requiredEnv = ['MONGODB_URI', 'JWT_SECRET'];
+const requiredEnv = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET'];
 const missing = requiredEnv.filter((k) => !process.env[k]);
 
 if (missing.length) {
@@ -41,9 +40,6 @@ if (
     console.warn(msg);
   }
 }
-
-// Conecta ao MongoDB
-connectDB();
 
 // ---- Middlewares globais ----
 // Atrás do proxy da Vercel, o IP real chega via X-Forwarded-For
@@ -102,7 +98,13 @@ app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime
 // ---- Rotinas agendadas ----
 async function sendMorningReminders() {
   console.log('[Cron] Enviando lembretes matinais...');
-  await broadcastPush(User, {}, {
+  const { data: users } = await supabase
+    .from('users')
+    .select('push_token')
+    .not('push_token', 'is', null);
+
+  const tokens = (users || []).map((u) => u.push_token);
+  await broadcastPush(tokens, {
     title: '⚔️ Suas missões aguardam!',
     body: 'Bom dia, Herói! Complete suas missões de hoje e mantenha seu streak.',
     data: { screen: 'Início' },
@@ -112,20 +114,27 @@ async function sendMorningReminders() {
 async function sendStreakAlerts() {
   console.log('[Cron] Enviando alertas de streak...');
 
-  // Busca usuários que ainda não completaram nenhuma missão hoje
   const today = new Date().toISOString().slice(0, 10);
-  const Mission = (await import('./src/models/Mission.js')).default;
 
-  const activeToday = await Mission.distinct('user', {
-    date: today,
-    status: 'completed',
-  });
+  // Usuários que já completaram alguma missão hoje (não precisam de alerta)
+  const { data: active } = await supabase
+    .from('missions')
+    .select('user_id')
+    .eq('date', today)
+    .eq('status', 'completed');
+  const activeIds = new Set((active || []).map((m) => m.user_id));
 
-  // Dispara só para quem tem streak > 0 e ainda não jogou hoje
-  await broadcastPush(User, {
-    _id: { $nin: activeToday },
-    'streak.current': { $gt: 0 },
-  }, {
+  // Candidatos: têm push_token; filtra streak > 0 e inatividade em JS
+  const { data: users } = await supabase
+    .from('users')
+    .select('id, push_token, streak')
+    .not('push_token', 'is', null);
+
+  const tokens = (users || [])
+    .filter((u) => (u.streak?.current ?? 0) > 0 && !activeIds.has(u.id))
+    .map((u) => u.push_token);
+
+  await broadcastPush(tokens, {
     title: '🔥 Não perca seu streak!',
     body: 'Ainda dá tempo! Complete uma missão agora e mantenha sua sequência.',
     data: { screen: 'Início' },

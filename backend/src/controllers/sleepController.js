@@ -1,13 +1,12 @@
-import SleepRecord from '../models/SleepRecord.js';
-import User from '../models/User.js';
+import { supabase } from '../config/supabase.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { clampStat } from '../utils/gamification.js';
+import { serializeSleep } from '../utils/serializers.js';
 
 /**
  * @route   POST /api/sleep
  * @desc    Registra uma noite de sono e concede HP conforme qualidade/duração
  * @access  Privado
- * @body    { bedtime, wakeTime, quality }
  */
 export const logSleep = asyncHandler(async (req, res) => {
   const { bedtime, wakeTime, quality } = req.body;
@@ -22,27 +21,37 @@ export const logSleep = asyncHandler(async (req, res) => {
   let durationMinutes = Math.round((end - start) / 60000);
   if (durationMinutes < 0) durationMinutes += 24 * 60; // virou o dia
 
-  // HP ganho: cheio (40) perto de 8h de sono, penaliza muito pouco ou muito
   const hours = durationMinutes / 60;
-  const idealScore = Math.max(0, 1 - Math.abs(hours - 8) / 8); // 0..1
+  const idealScore = Math.max(0, 1 - Math.abs(hours - 8) / 8);
   const q = quality || 3;
   const hpGained = Math.round(40 * idealScore * (q / 5));
 
-  const record = await SleepRecord.create({
-    user: req.user._id,
-    bedtime: start,
-    wakeTime: end,
-    durationMinutes,
-    quality: q,
-    hpGained,
-    date: end.toISOString().slice(0, 10),
-  });
+  const { data: record, error } = await supabase
+    .from('sleep_records')
+    .insert({
+      user_id: req.user.id,
+      bedtime: start.toISOString(),
+      wake_time: end.toISOString(),
+      duration_minutes: durationMinutes,
+      quality: q,
+      hp_gained: hpGained,
+      date: end.toISOString().slice(0, 10),
+    })
+    .select('*')
+    .single();
 
-  const user = await User.findById(req.user._id);
-  user.stats.hp = clampStat(user.stats.hp + hpGained, user.stats.maxHp);
-  await user.save();
+  if (error) throw new Error(error.message);
 
-  res.status(201).json({ record, stats: user.stats });
+  const stats = { ...req.user.stats };
+  stats.hp = clampStat(stats.hp + hpGained, stats.maxHp);
+
+  const { error: uErr } = await supabase
+    .from('users')
+    .update({ stats, updated_at: new Date().toISOString() })
+    .eq('id', req.user.id);
+  if (uErr) throw new Error(uErr.message);
+
+  res.status(201).json({ record: serializeSleep(record), stats });
 });
 
 /**
@@ -52,10 +61,15 @@ export const logSleep = asyncHandler(async (req, res) => {
  */
 export const getHistory = asyncHandler(async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 30, 200);
-  const records = await SleepRecord.find({ user: req.user._id })
-    .sort({ date: -1 })
+  const { data, error } = await supabase
+    .from('sleep_records')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .order('date', { ascending: false })
     .limit(limit);
-  res.json(records);
+
+  if (error) throw new Error(error.message);
+  res.json((data || []).map(serializeSleep));
 });
 
 /**
@@ -64,22 +78,24 @@ export const getHistory = asyncHandler(async (req, res) => {
  * @access  Privado
  */
 export const getStats = asyncHandler(async (req, res) => {
-  const agg = await SleepRecord.aggregate([
-    { $match: { user: req.user._id } },
-    {
-      $group: {
-        _id: null,
-        nights: { $sum: 1 },
-        avgMinutes: { $avg: '$durationMinutes' },
-        avgQuality: { $avg: '$quality' },
-        totalHpGained: { $sum: '$hpGained' },
-      },
-    },
-  ]);
+  const { data, error } = await supabase
+    .from('sleep_records')
+    .select('duration_minutes, quality, hp_gained')
+    .eq('user_id', req.user.id);
 
-  const stats = agg[0] || { nights: 0, avgMinutes: 0, avgQuality: 0, totalHpGained: 0 };
-  delete stats._id;
-  stats.avgHours = Math.round(((stats.avgMinutes || 0) / 60) * 10) / 10;
+  if (error) throw new Error(error.message);
 
-  res.json(stats);
+  const records = data || [];
+  const nights = records.length;
+  const avgMinutes = nights ? records.reduce((s, r) => s + (r.duration_minutes || 0), 0) / nights : 0;
+  const avgQuality = nights ? records.reduce((s, r) => s + (r.quality || 0), 0) / nights : 0;
+  const totalHpGained = records.reduce((s, r) => s + (r.hp_gained || 0), 0);
+
+  res.json({
+    nights,
+    avgMinutes,
+    avgQuality,
+    totalHpGained,
+    avgHours: Math.round((avgMinutes / 60) * 10) / 10,
+  });
 });

@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
+import { supabase } from '../config/supabase.js';
 
 /**
  * Gera um token JWT para um usuário.
@@ -11,7 +11,7 @@ export const generateToken = (userId) =>
 
 /**
  * Middleware que protege rotas: exige um Bearer token válido
- * no header Authorization e injeta req.user.
+ * no header Authorization e injeta req.user (linha da tabela users).
  */
 export const protect = async (req, res, next) => {
   let token;
@@ -27,13 +27,18 @@ export const protect = async (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id);
 
-    if (!user) {
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', decoded.id)
+      .single();
+
+    if (error || !user) {
       return res.status(401).json({ message: 'Não autorizado: usuário não encontrado' });
     }
 
-    req.user = user;
+    req.user = user; // linha completa (snake_case)
     next();
   } catch (err) {
     return res.status(401).json({ message: 'Não autorizado: token inválido ou expirado' });

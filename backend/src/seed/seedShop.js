@@ -1,7 +1,5 @@
 import dotenv from 'dotenv';
-import { connectDB } from '../config/db.js';
-import mongoose from 'mongoose';
-import ShopItem from '../models/ShopItem.js';
+import { supabase } from '../config/supabase.js';
 
 dotenv.config();
 
@@ -69,20 +67,20 @@ const items = [
 ];
 
 const seed = async () => {
-  await connectDB();
   console.log('🌱 Populando a loja...');
 
-  for (const item of items) {
-    await ShopItem.findOneAndUpdate({ key: item.key }, item, {
-      upsert: true,
-      new: true,
-      setDefaultsOnInsert: true,
-    });
-    console.log(`   ✔ ${item.icon} ${item.name}`);
+  // upsert por "key" (idempotente)
+  const { error } = await supabase
+    .from('shop_items')
+    .upsert(items, { onConflict: 'key' });
+
+  if (error) {
+    console.error('Erro no seed:', error.message);
+    process.exit(1);
   }
 
+  for (const item of items) console.log(`   ✔ ${item.icon} ${item.name}`);
   console.log('✅ Loja populada com sucesso!');
-  await mongoose.connection.close();
   process.exit(0);
 };
 

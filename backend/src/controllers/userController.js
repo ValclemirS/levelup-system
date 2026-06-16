@@ -1,7 +1,7 @@
-import User from '../models/User.js';
+import { supabase } from '../config/supabase.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
-import { applyXpToUser, clampStat } from '../utils/gamification.js';
-import JourneyEvent from '../models/JourneyEvent.js';
+import { applyXpToStats, clampStat } from '../utils/gamification.js';
+import { publicUser, serializeJourney } from '../utils/serializers.js';
 import { Expo } from 'expo-server-sdk';
 
 /**
@@ -10,8 +10,16 @@ import { Expo } from 'expo-server-sdk';
  * @access  Privado
  */
 export const getProfile = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id).populate('guild', 'name emblem totalXp');
-  res.json(user.toPublic());
+  let guild;
+  if (req.user.guild_id) {
+    const { data: g } = await supabase
+      .from('guilds')
+      .select('id, name, emblem, total_xp')
+      .eq('id', req.user.guild_id)
+      .single();
+    if (g) guild = { id: g.id, name: g.name, emblem: g.emblem, totalXp: g.total_xp };
+  }
+  res.json(publicUser(req.user, guild));
 });
 
 /**
@@ -21,33 +29,42 @@ export const getProfile = asyncHandler(async (req, res) => {
  */
 export const updateProfile = asyncHandler(async (req, res) => {
   const { displayName, avatar, title } = req.body;
-  const user = await User.findById(req.user._id);
 
-  if (displayName !== undefined) user.displayName = displayName;
-  if (avatar !== undefined) user.avatar = avatar;
-  if (title !== undefined) user.title = title;
+  const patch = { updated_at: new Date().toISOString() };
+  if (displayName !== undefined) patch.display_name = displayName;
+  if (avatar !== undefined) patch.avatar = avatar;
+  if (title !== undefined) patch.title = title;
 
-  await user.save();
-  res.json(user.toPublic());
+  const { data: user, error } = await supabase
+    .from('users')
+    .update(patch)
+    .eq('id', req.user.id)
+    .select('*')
+    .single();
+
+  if (error) throw new Error(error.message);
+  res.json(publicUser(user));
 });
 
 /**
  * @route   POST /api/users/me/xp
- * @desc    Concede XP avulso (uso administrativo/eventos) e processa level up
+ * @desc    Concede XP avulso e processa level up
  * @access  Privado
- * @body    { amount }
  */
 export const grantXp = asyncHandler(async (req, res) => {
   const amount = Number(req.body.amount) || 0;
-  const user = await User.findById(req.user._id);
 
-  const { prevLevel, newLevel, leveledUp } = applyXpToUser(user, amount);
+  const { stats, prevLevel, newLevel, leveledUp } = applyXpToStats(req.user.stats, amount);
 
-  await user.save();
+  const { error } = await supabase
+    .from('users')
+    .update({ stats, updated_at: new Date().toISOString() })
+    .eq('id', req.user.id);
+  if (error) throw new Error(error.message);
 
   if (newLevel > prevLevel) {
-    await JourneyEvent.create({
-      user: user._id,
+    await supabase.from('journey_events').insert({
+      user_id: req.user.id,
       type: 'level_up',
       title: `Subiu para o nível ${newLevel}!`,
       description: `Você alcançou o nível ${newLevel}.`,
@@ -56,51 +73,53 @@ export const grantXp = asyncHandler(async (req, res) => {
     });
   }
 
-  res.json({ stats: user.stats, leveledUp });
+  res.json({ stats, leveledUp });
 });
 
 /**
  * @route   POST /api/users/me/vitals
- * @desc    Ajusta HP/Mana diretamente (ex.: dano por hábito ruim, descanso)
+ * @desc    Ajusta HP/Mana diretamente (deltas, podem ser negativos)
  * @access  Privado
- * @body    { hp, mana }  (deltas, podem ser negativos)
  */
 export const adjustVitals = asyncHandler(async (req, res) => {
   const { hp = 0, mana = 0 } = req.body;
-  const user = await User.findById(req.user._id);
+  const stats = { ...req.user.stats };
 
-  user.stats.hp = clampStat(user.stats.hp + Number(hp), user.stats.maxHp);
-  user.stats.mana = clampStat(user.stats.mana + Number(mana), user.stats.maxMana);
+  stats.hp = clampStat(stats.hp + Number(hp), stats.maxHp);
+  stats.mana = clampStat(stats.mana + Number(mana), stats.maxMana);
 
-  await user.save();
-  res.json({ stats: user.stats });
+  const { error } = await supabase
+    .from('users')
+    .update({ stats, updated_at: new Date().toISOString() })
+    .eq('id', req.user.id);
+  if (error) throw new Error(error.message);
+
+  res.json({ stats });
 });
 
 /**
  * @route   GET /api/users/leaderboard
  * @desc    Ranking global de jogadores por nível e XP
  * @access  Privado
- * @query   ?limit=20
  */
 export const getLeaderboard = asyncHandler(async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 100);
 
-  const players = await User.find()
-    .sort({ 'stats.level': -1, 'stats.xp': -1 })
-    .limit(limit)
-    .select('username displayName avatar title stats.level stats.xp guild')
-    .populate('guild', 'name emblem');
+  // RPC garante ordenação numérica por nível/XP (jsonb ordenaria como texto).
+  const { data: players, error } = await supabase.rpc('get_leaderboard', { p_limit: limit });
 
-  const ranked = players.map((p, i) => ({
+  if (error) throw new Error(error.message);
+
+  const ranked = (players || []).map((p, i) => ({
     rank: i + 1,
-    id: p._id,
+    id: p.id,
     username: p.username,
-    displayName: p.displayName,
+    displayName: p.display_name,
     avatar: p.avatar,
     title: p.title,
-    level: p.stats.level,
-    xp: p.stats.xp,
-    guild: p.guild,
+    level: p.stats?.level ?? 1,
+    xp: p.stats?.xp ?? 0,
+    guild: p.guild_id,
   }));
 
   res.json(ranked);
@@ -110,7 +129,6 @@ export const getLeaderboard = asyncHandler(async (req, res) => {
  * @route   PUT /api/users/me/push-token
  * @desc    Salva ou atualiza o Expo Push Token do dispositivo
  * @access  Privado
- * @body    { token }
  */
 export const savePushToken = asyncHandler(async (req, res) => {
   const { token } = req.body;
@@ -120,7 +138,12 @@ export const savePushToken = asyncHandler(async (req, res) => {
     throw new Error('Token de push inválido');
   }
 
-  await User.findByIdAndUpdate(req.user._id, { pushToken: token });
+  const { error } = await supabase
+    .from('users')
+    .update({ push_token: token, updated_at: new Date().toISOString() })
+    .eq('id', req.user.id);
+  if (error) throw new Error(error.message);
+
   res.json({ ok: true });
 });
 
@@ -131,8 +154,14 @@ export const savePushToken = asyncHandler(async (req, res) => {
  */
 export const getJourney = asyncHandler(async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 50, 200);
-  const events = await JourneyEvent.find({ user: req.user._id })
-    .sort({ createdAt: -1 })
+
+  const { data: events, error } = await supabase
+    .from('journey_events')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
     .limit(limit);
-  res.json(events);
+
+  if (error) throw new Error(error.message);
+  res.json((events || []).map(serializeJourney));
 });
